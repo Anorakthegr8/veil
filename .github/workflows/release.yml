@@ -8,8 +8,8 @@ on:
 concurrency: ${{ github.workflow }}-${{ github.ref }}
 
 permissions:
-  contents: write
-  pull-requests: write
+  # The release job needs the wider scope, and declares it on the job.
+  contents: read
 
 jobs:
   release:
@@ -46,7 +46,7 @@ jobs:
             echo "::group::$pkg"
             (
               cd "$pkg"
-              npm ci --no-audit --no-fund || npm install --no-audit --no-fund
+              npm ci --no-audit --no-fund || { echo "::warning::npm ci failed; falling back to npm install"; npm install --no-audit --no-fund; }
               npm run build --if-present
             )
             echo "::endgroup::"

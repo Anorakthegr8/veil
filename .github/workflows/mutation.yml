@@ -10,10 +10,19 @@ on:
         required: false
         type: string
 
+permissions:
+  contents: read
+
 jobs:
   stryker:
     name: Stryker — SDK signing primitives
     runs-on: ubuntu-latest
+    permissions:
+      # Posts the mutation score onto a pull request. Commenting on a PR needs
+      # `pull-requests: write`, even though the endpoint is /issues/{n}/comments.
+      contents: read
+      issues: write
+      pull-requests: write
     defaults:
       run:
         working-directory: sdk
@@ -27,7 +36,7 @@ jobs:
           cache: npm
           cache-dependency-path: sdk/package-lock.json
 
-      - run: npm ci || npm install
+      - run: npm ci || { echo "::warning::npm ci failed; falling back to npm install"; npm install; }
 
       - name: Run Stryker mutation tests
         run: npx stryker run
