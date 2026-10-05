@@ -1,122 +1,83 @@
 import { TextEncoder, TextDecoder } from 'util'
 Object.assign(globalThis, { TextEncoder, TextDecoder })
 
+import { isPrivacyEnabled, getSppConfig } from '../privacy/config'
 import {
-  isPrivacyEnabled,
-  getPrivacyConfig,
-  PRIVACY_CONFIGS,
-} from '../privacy/config'
-import {
-  getPrivateBalance,
-  setPrivateBalance,
-  unshield,
-} from '../privacy/client'
-import { walletLocal } from '../walletStorage'
+  stroopsToXlm,
+  withdrawableAssetCodes,
+  xlmToStroops,
+} from '../../app/privacy/unshield/amounts'
 
-describe('Privacy Config & Mainnet Lockout', () => {
-  it('enables privacy on testnet and strictly locks out mainnet', () => {
-    expect(isPrivacyEnabled('testnet')).toBe(true)
+/**
+ * Unshield moves money out of a shielded pool to a public address, so the
+ * things worth pinning are the ones that decide whether it can run at all and
+ * how much leaves: the mainnet lockout, which pools really exist, and the
+ * amount arithmetic.
+ */
+
+describe('mainnet lockout', () => {
+  it('is off on mainnet whatever the feature flag says', () => {
+    // Unconditional, because there is no mainnet SPP deployment to talk to.
     expect(isPrivacyEnabled('mainnet')).toBe(false)
   })
 
-  it('returns canonical SPP testnet pool configurations', () => {
-    const config = getPrivacyConfig('testnet')
-    expect(config).not.toBeNull()
-    expect(config?.pools.XLM.contractId).toBe('CD2W5LURT7H33ZMSXZQZNDD2MDR725J3B6Y7G22Y26L65I32FHK4XZ4L')
-    expect(config?.pools.EURC.contractId).toBe('CBMRWHTP23BAMQZ73N4Y5V5KDJM2KEX77R5G6H3N4WUSQ7R2T2J2NUVS')
-  })
-
-  it('returns null config on mainnet', () => {
-    expect(getPrivacyConfig('mainnet')).toBeNull()
+  it('has no mainnet SPP configuration to point at', () => {
+    expect(getSppConfig('mainnet')).toBeNull()
   })
 })
 
-describe('Privacy Client & Unshield Flow', () => {
-  beforeEach(() => {
-    walletLocal.setItem('veil_private_bal_XLM', '100.0000000')
-    walletLocal.setItem('veil_private_bal_USDC', '50.0000000')
+describe('the pools that actually exist', () => {
+  it('pins two testnet pools, both of them XLM', () => {
+    const config = getSppConfig('testnet')
+    expect(config).not.toBeNull()
+    expect(config!.pools).toHaveLength(2)
+    for (const pool of config!.pools) expect(pool.assetKind).toBe('native')
   })
 
-  it('loads and manages private balance correctly', async () => {
-    const balance = await getPrivateBalance('XLM')
-    expect(balance).toBe('100.0000000')
-
-    await setPrivateBalance('80.0000000', 'XLM')
-    const updated = await getPrivateBalance('XLM')
-    expect(updated).toBe('80.0000000')
+  it('offers XLM and nothing else to withdraw', () => {
+    // The screen used to offer USDC and EURC from a hand-written list. Neither
+    // has a pool, so both were a flow that could only fail — and one of the two
+    // issuer addresses in that list was not a valid Stellar address at all.
+    expect(withdrawableAssetCodes('testnet')).toEqual(['XLM'])
   })
 
-  it('blocks withdrawing more than private balance before any proof is generated', async () => {
-    const onProgress = jest.fn()
+  it('offers nothing on mainnet', () => {
+    expect(withdrawableAssetCodes('mainnet')).toEqual([])
+  })
+})
 
-    await expect(
-      unshield({
-        amount: '150.0000000',
-        asset: 'XLM',
-        destinationAddress: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
-        onProgress,
-      }),
-    ).rejects.toThrow(/Insufficient private balance/)
-
-    // Proof progress should never have been triggered
-    expect(onProgress).not.toHaveBeenCalled()
-
-    // Balance must remain unchanged
-    const balance = await getPrivateBalance('XLM')
-    expect(balance).toBe('100.0000000')
+describe('amount arithmetic', () => {
+  it('converts whole and fractional XLM to stroops', () => {
+    expect(xlmToStroops('1')).toBe(10_000_000n)
+    expect(xlmToStroops('0.0000001')).toBe(1n)
+    expect(xlmToStroops('12.5')).toBe(125_000_000n)
   })
 
-  it('blocks invalid withdrawal amounts (zero or negative)', async () => {
-    await expect(
-      unshield({
-        amount: '0',
-        asset: 'XLM',
-        destinationAddress: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
-      }),
-    ).rejects.toThrow(/Invalid withdrawal amount/)
-
-    await expect(
-      unshield({
-        amount: '-10.5',
-        asset: 'XLM',
-        destinationAddress: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
-      }),
-    ).rejects.toThrow(/Invalid withdrawal amount/)
+  it('round-trips through the display form', () => {
+    for (const value of ['1', '0.0000001', '12.5', '1000000']) {
+      expect(stroopsToXlm(xlmToStroops(value)!)).toBe(value)
+    }
   })
 
-  it('blocks invalid or missing destination address', async () => {
-    await expect(
-      unshield({
-        amount: '20.0000000',
-        asset: 'XLM',
-        destinationAddress: '',
-      }),
-    ).rejects.toThrow(/Valid destination address required/)
+  it('drops trailing zeros rather than printing them', () => {
+    expect(stroopsToXlm(125_000_000n)).toBe('12.5')
+    expect(stroopsToXlm(10_000_000n)).toBe('1')
   })
 
-  it('successfully executes unshield, notifies progress, and updates private balance', async () => {
-    const progressSteps: string[] = []
-    const dest = 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5'
+  it('refuses anything that is not a plain decimal amount', () => {
+    // parseFloat would accept every one of these and hand back a number that
+    // decides how much money leaves a shielded pool.
+    for (const junk of ['', '  ', 'abc', '1.2.3', '1e9', '12abc', '-1', '.5', '1.00000001']) {
+      expect(xlmToStroops(junk)).toBeNull()
+    }
+  })
 
-    const result = await unshield({
-      amount: '35.0000000',
-      asset: 'XLM',
-      destinationAddress: dest,
-      onProgress: (status) => progressSteps.push(status),
-    })
+  it('accepts surrounding whitespace, since people paste amounts', () => {
+    expect(xlmToStroops('  2.5  ')).toBe(25_000_000n)
+  })
 
-    expect(result.amount).toBe('35.0000000')
-    expect(result.asset).toBe('XLM')
-    expect(result.destinationAddress).toBe(dest)
-    expect(result.txHash).toBeDefined()
-    expect(result.txHash.length).toBe(64)
-
-    // Verify progress callbacks were invoked
-    expect(progressSteps.length).toBeGreaterThan(0)
-    expect(progressSteps.some((s) => s.includes('proof'))).toBe(true)
-
-    // Verify private balance was decremented (100 - 35 = 65)
-    const newBal = await getPrivateBalance('XLM')
-    expect(newBal).toBe('65.0000000')
+  it('handles an amount larger than a double can hold exactly', () => {
+    // The reason this is bigint arithmetic and not floating point.
+    expect(xlmToStroops('9007199254.7409911')).toBe(90_071_992_547_409_911n)
   })
 })

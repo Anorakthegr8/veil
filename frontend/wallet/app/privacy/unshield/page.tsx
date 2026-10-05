@@ -2,36 +2,32 @@
 
 import { useState, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
-import { Horizon } from '@stellar/stellar-sdk'
+import { Horizon, StrKey } from '@stellar/stellar-sdk'
 import { Nav, Label, Amount as AmountDisplay, TokenIcon } from '@/components/ui/primitives'
 import { useInactivityLock } from '@/hooks/useInactivityLock'
 import { walletLocal, walletSession } from '@/lib/walletStorage'
 import { getNetwork } from '@/lib/network'
 import { isPrivacyEnabled } from '@/lib/privacy/config'
-import { getPrivateBalance, unshield, type UnshieldResult } from '@/lib/privacy/client'
+import { withdrawableAssetCodes, xlmToStroops, stroopsToXlm } from './amounts'
+import {
+  attachPrivacyProgress,
+  getPrivacyClient,
+  toUserFacingPrivacyError,
+  type PrivacyClient,
+} from '@/lib/privacy/client'
+import { explorerNetworkSegment } from '@/lib/about'
 
 type Step = 'amount' | 'review' | 'proving' | 'complete' | 'error'
-
-interface PoolAsset {
-  code: string
-  name: string
-  issuer: string | null
-}
-
-const POOL_ASSETS: PoolAsset[] = [
-  { code: 'XLM', name: 'Stellar Lumens', issuer: null },
-  { code: 'USDC', name: 'USD Coin', issuer: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5' },
-  { code: 'EURC', name: 'Euro Coin', issuer: 'GBUEHGTHFDD2URZ5CTSTODQC5WEN27D7D62I4VLVLSAWV7HHA2G2P6EU' },
-]
 
 export default function UnshieldPage() {
   const router = useRouter()
   useInactivityLock()
 
   const [step, setStep] = useState<Step>('amount')
-  const [selectedAsset, setSelectedAsset] = useState<PoolAsset>(POOL_ASSETS[0])
   const [amount, setAmount] = useState('')
-  const [privateBalance, setPrivateBalance] = useState('0.0000000')
+  // null means "we could not read it", which is not the same as zero — a zero
+  // shown for an unreadable balance invites someone to try to withdraw nothing.
+  const [privateBalanceStroops, setPrivateBalanceStroops] = useState<bigint | null>(null)
   const [publicBalance, setPublicBalance] = useState('0.0000000')
 
   // Destination account state
@@ -41,11 +37,21 @@ export default function UnshieldPage() {
 
   // Transaction & Proving state
   const [provingStatus, setProvingStatus] = useState('Generating proof...')
-  const [txResult, setTxResult] = useState<UnshieldResult | null>(null)
+  const [txHash, setTxHash] = useState<string | null>(null)
+  const [sentAmount, setSentAmount] = useState('')
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
   const [isLoadingBalances, setIsLoadingBalances] = useState(true)
 
   const network = getNetwork()
+  const assetCodes = withdrawableAssetCodes(network.name)
+  const assetCode = assetCodes[0] ?? 'XLM'
+
+  // Progress comes from the SPP client as it works, rather than being narrated
+  // on a timer. If it says nothing, the screen says the generic line.
+  useEffect(
+    () => attachPrivacyProgress((event) => setProvingStatus(event.message)),
+    [],
+  )
 
   // Load account addresses and initial balances
   useEffect(() => {
@@ -67,72 +73,78 @@ export default function UnshieldPage() {
     async function loadBalances() {
       setIsLoadingBalances(true)
       try {
-        // Load private balance
-        const privBal = await getPrivateBalance(selectedAsset.code)
-        setPrivateBalance(privBal)
+        const client = await getPrivacyClient()
+        setPrivateBalanceStroops(await client.privateBalance())
 
         // Load public balance if address exists
-        if (defaultDest && defaultDest.startsWith('G')) {
+        if (defaultDest && StrKey.isValidEd25519PublicKey(defaultDest)) {
           const server = new Horizon.Server(network.horizonUrl)
           const account = await server.loadAccount(defaultDest)
-          const assetBal = account.balances.find((b) =>
-            selectedAsset.code === 'XLM'
-              ? b.asset_type === 'native'
-              : (b as { asset_code?: string }).asset_code === selectedAsset.code,
-          )
+          const assetBal = account.balances.find((b) => b.asset_type === 'native')
           setPublicBalance(assetBal ? assetBal.balance : '0.0000000')
         }
-      } catch {
-        // Fallback gracefully on network / account load issues
+      } catch (err) {
+        // The shielded balance stays null, which renders as "Unavailable" and
+        // blocks the flow, rather than as a zero the user might act on.
+        setErrorMessage(toUserFacingPrivacyError(err))
       } finally {
         setIsLoadingBalances(false)
       }
     }
 
     void loadBalances()
-  }, [network, selectedAsset])
+  }, [network])
 
-  const parsedAmount = parseFloat(amount) || 0
-  const parsedPrivateBalance = parseFloat(privateBalance) || 0
-  const isAmountExceeding = parsedAmount > parsedPrivateBalance
-  const isAmountValid = parsedAmount > 0 && !isAmountExceeding
-  const isDestinationValid = destinationAddress.trim().length >= 5
+  const amountStroops = xlmToStroops(amount)
+  const isAmountExceeding =
+    amountStroops !== null && privateBalanceStroops !== null && amountStroops > privateBalanceStroops
+  const isAmountValid =
+    amountStroops !== null && amountStroops > 0n && privateBalanceStroops !== null && !isAmountExceeding
+  // A withdrawal leaves the pool for a real account. "At least five characters"
+  // would send one to a typo, and there is nothing to undo it with.
+  const isDestinationValid = StrKey.isValidEd25519PublicKey(destinationAddress.trim())
 
   const canProceedToReview = isAmountValid && isDestinationValid && !isLoadingBalances
 
   const handleSetPercent = (percent: number) => {
-    if (parsedPrivateBalance <= 0) return
-    const calculated = (parsedPrivateBalance * (percent / 100)).toFixed(7)
-    setAmount(calculated)
+    if (privateBalanceStroops === null || privateBalanceStroops <= 0n) return
+    setAmount(stroopsToXlm((privateBalanceStroops * BigInt(percent)) / 100n))
   }
 
   const handleStartUnshield = async () => {
     // Strict pre-proof validation check
-    if (!isAmountValid || !isDestinationValid) return
+    if (!isAmountValid || !isDestinationValid || amountStroops === null) return
 
     setStep('proving')
     setProvingStatus('Initializing zero-knowledge prover...')
     setErrorMessage(null)
 
     try {
-      const result = await unshield({
-        amount: parsedAmount.toFixed(7),
-        asset: selectedAsset.code,
-        destinationAddress: destinationAddress.trim(),
-        onProgress: (status) => setProvingStatus(status),
-      })
+      const client: PrivacyClient = await getPrivacyClient()
+      const hash = await client.unshield(amountStroops, destinationAddress.trim())
 
-      setTxResult(result)
+      setTxHash(hash)
+      setSentAmount(stroopsToXlm(amountStroops))
 
-      // Refresh balances after unshield
-      const newPrivBal = await getPrivateBalance(selectedAsset.code)
-      setPrivateBalance(newPrivBal)
-      const newPubBal = (parseFloat(publicBalance) + parsedAmount).toFixed(7)
-      setPublicBalance(newPubBal)
+      // Re-read both balances rather than doing arithmetic on them: the pool
+      // decides what actually moved, and a locally computed figure beside a
+      // real transaction hash is a number nobody can reconcile.
+      setPrivateBalanceStroops(await client.privateBalance())
+      if (StrKey.isValidEd25519PublicKey(destinationAddress.trim())) {
+        try {
+          const server = new Horizon.Server(network.horizonUrl)
+          const account = await server.loadAccount(destinationAddress.trim())
+          const assetBal = account.balances.find((b) => b.asset_type === 'native')
+          if (assetBal) setPublicBalance(assetBal.balance)
+        } catch {
+          // The withdrawal succeeded; only the follow-up read did not. Leave the
+          // previous figure rather than inventing one.
+        }
+      }
 
       setStep('complete')
     } catch (err) {
-      setErrorMessage((err as Error).message || 'Failed to complete unshield transaction.')
+      setErrorMessage(toUserFacingPrivacyError(err))
       setStep('error')
     }
   }
@@ -169,17 +181,21 @@ export default function UnshieldPage() {
 
               <div className="flex items-baseline gap-2">
                 <AmountDisplay className="text-3xl font-bold text-[var(--gold)]">
-                  {isLoadingBalances ? '...' : privateBalance}
+                  {isLoadingBalances
+                    ? '...'
+                    : privateBalanceStroops === null
+                      ? 'Unavailable'
+                      : stroopsToXlm(privateBalanceStroops)}
                 </AmountDisplay>
                 <span className="text-sm font-semibold text-[rgba(246,247,248,0.6)]">
-                  {selectedAsset.code}
+                  {assetCode}
                 </span>
               </div>
 
               <div className="pt-2 border-t border-[rgba(255,255,255,0.06)] flex justify-between text-xs text-[rgba(246,247,248,0.5)]">
                 <span>Public Spending Balance:</span>
                 <span className="font-mono text-[var(--off-white)]">
-                  {publicBalance} {selectedAsset.code}
+                  {publicBalance} {assetCode}
                 </span>
               </div>
             </div>
@@ -188,22 +204,19 @@ export default function UnshieldPage() {
             <div className="flex flex-col gap-1.5">
               <Label>Select Asset</Label>
               <div className="grid grid-cols-3 gap-2">
-                {POOL_ASSETS.map((asset) => (
+                {assetCodes.map((code) => (
                   <button
-                    key={asset.code}
+                    key={code}
                     type="button"
-                    onClick={() => {
-                      setSelectedAsset(asset)
-                      setAmount('')
-                    }}
+                    onClick={() => setAmount('')}
                     className={`flex items-center gap-2 p-2.5 rounded-xl border text-left transition-all ${
-                      selectedAsset.code === asset.code
+                      code === assetCode
                         ? 'border-[var(--gold)] bg-[rgba(253,218,36,0.08)]'
                         : 'border-[var(--border-dim)] bg-[var(--surface)] hover:bg-[var(--surface-md)]'
                     }`}
                   >
-                    <TokenIcon code={asset.code} size={22} />
-                    <span className="font-bold text-sm">{asset.code}</span>
+                    <TokenIcon code={code} size={22} />
+                    <span className="font-bold text-sm">{code}</span>
                   </button>
                 ))}
               </div>
@@ -335,6 +348,10 @@ export default function UnshieldPage() {
                   Stellar ledger. The destination address and withdrawal amount will be visible
                   on-chain. Transactions inside the private pool remain hidden.
                 </p>
+                <p className="text-[rgba(246,247,248,0.8)] leading-relaxed">
+                  Unaudited preview — testnet only. The private pool has not been through a
+                  security audit; do not move funds you cannot afford to lose.
+                </p>
               </div>
             </div>
 
@@ -346,9 +363,9 @@ export default function UnshieldPage() {
                 <span className="text-sm text-[rgba(246,247,248,0.6)]">Amount</span>
                 <div className="flex items-center gap-1.5">
                   <AmountDisplay className="text-lg font-bold text-[var(--gold)]">
-                    {parsedAmount.toFixed(7)}
+                    {amountStroops === null ? '0' : stroopsToXlm(amountStroops)}
                   </AmountDisplay>
-                  <span className="text-sm font-semibold">{selectedAsset.code}</span>
+                  <span className="text-sm font-semibold">{assetCode}</span>
                 </div>
               </div>
 
@@ -423,7 +440,7 @@ export default function UnshieldPage() {
         )}
 
         {/* ── STEP 4: COMPLETE ────────────────────────────────────────────────── */}
-        {step === 'complete' && txResult && (
+        {step === 'complete' && txHash && (
           <div className="flex flex-col gap-6 py-6" data-testid="complete-screen">
             <div className="flex flex-col items-center text-center gap-3">
               <div className="w-16 h-16 rounded-full bg-[rgba(0,167,181,0.15)] border border-[rgba(0,167,181,0.4)] flex items-center justify-center text-3xl">
@@ -442,21 +459,21 @@ export default function UnshieldPage() {
               <div className="flex justify-between items-center py-1">
                 <span className="text-xs text-[rgba(246,247,248,0.5)]">Amount Withdrawn</span>
                 <span className="font-mono text-sm font-bold text-[var(--gold)]">
-                  +{txResult.amount} {txResult.asset}
+                  +{sentAmount} {assetCode}
                 </span>
               </div>
 
               <div className="flex justify-between items-center py-1 border-t border-[rgba(255,255,255,0.06)]">
                 <span className="text-xs text-[rgba(246,247,248,0.5)]">Updated Private Balance</span>
                 <span className="font-mono text-xs text-[var(--off-white)]">
-                  {privateBalance} {txResult.asset}
+                  {privateBalanceStroops === null ? 'Unavailable' : stroopsToXlm(privateBalanceStroops)} {assetCode}
                 </span>
               </div>
 
               <div className="flex justify-between items-center py-1 border-t border-[rgba(255,255,255,0.06)]">
                 <span className="text-xs text-[rgba(246,247,248,0.5)]">Updated Spending Balance</span>
                 <span className="font-mono text-xs text-[var(--teal)] font-semibold">
-                  {publicBalance} {txResult.asset}
+                  {publicBalance} {assetCode}
                 </span>
               </div>
 
@@ -465,12 +482,12 @@ export default function UnshieldPage() {
                   Transaction Hash
                 </span>
                 <a
-                  href={`https://stellar.expert/explorer/testnet/tx/${txResult.txHash}`}
+                  href={`https://stellar.expert/explorer/${explorerNetworkSegment()}/tx/${txHash}`}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="font-mono text-[11px] text-[var(--teal)] hover:underline truncate"
                 >
-                  {txResult.txHash}
+                  {txHash}
                 </a>
               </div>
             </div>
