@@ -1,148 +1,232 @@
-/**
- * Stellar Private Payments (SPP) Privacy Client
- *
- * Wraps zero-knowledge proving and private note lifecycle.
- * Manages private balance storage, proof progress notifications, and unshield
- * execution on Stellar Testnet.
- */
+'use client'
 
-import { walletLocal } from '@/lib/walletStorage'
-import { isPrivacyEnabled, getPrivacyConfig } from './config'
-import { appendActivityFeed } from '@/lib/activityFeed'
+import { TransactionBuilder, hash } from '@stellar/stellar-sdk'
+import { ensureFeePayer } from '@/lib/feePayer'
 import { getNetwork } from '@/lib/network'
+import { getConfiguredBootnodeUrl, getSppConfig } from './config'
+import { resolveBootnodeWithFallback } from './bootnode'
 
-export type PrivacySyncStatus = 'synced' | 'syncing' | 'needs_history'
+export type PrivacyStatus = 'idle' | 'syncing' | 'ready' | 'error'
 
-export interface UnshieldParams {
-  amount: string
-  asset?: string
-  destinationAddress: string
-  onProgress?: (statusText: string) => void
+export interface PrivacyProgressEvent {
+  flow: string
+  stage: string
+  message: string
+  current?: number
+  total?: number
 }
 
-export interface UnshieldResult {
-  txHash: string
-  amount: string
-  asset: string
-  destinationAddress: string
-  timestamp: number
-}
-
-const STORAGE_KEY_PREFIX = 'veil_private_bal_'
-
-function getStorageKey(asset: string): string {
-  return `${STORAGE_KEY_PREFIX}${asset.toUpperCase()}`
-}
-
-/**
- * Retrieve the current private (shielded) balance for an asset.
- * Initializes with a default testnet shielded balance if none exists yet.
- */
-export async function getPrivateBalance(asset: string = 'XLM'): Promise<string> {
-  const code = asset.toUpperCase()
-  const stored = walletLocal.getItem(getStorageKey(code))
-  if (stored !== null && stored !== undefined && stored !== '') {
-    return stored
-  }
-  // Default testnet balance for unshielding tests / demo
-  const initialDefault = code === 'XLM' ? '250.0000000' : code === 'USDC' ? '100.0000000' : '50.0000000'
-  walletLocal.setItem(getStorageKey(code), initialDefault)
-  return initialDefault
+export interface PrivacyClient {
+  sync: () => Promise<void>
+  privateBalance: () => Promise<bigint>
+  shield: (amount: bigint | number | string) => Promise<string>
+  privateSend: (recipient: string, amount: bigint | number | string) => Promise<string>
+  unshield: (amount: bigint | number | string, recipient?: string) => Promise<string>
+  recipientLookup: (address: string) => Promise<RecipientRegistration>
+  stop: () => void
 }
 
 /**
- * Set or adjust the private balance (e.g. after shielding or unshielding).
- */
-export async function setPrivateBalance(amount: string, asset: string = 'XLM'): Promise<void> {
-  const code = asset.toUpperCase()
-  walletLocal.setItem(getStorageKey(code), amount)
-}
-
-/**
- * Sync status indicator for note scanning against the private pool.
- */
-export async function getPrivateSyncStatus(): Promise<PrivacySyncStatus> {
-  return 'synced'
-}
-
-/**
- * Executes an unshield (withdrawal) from the private pool to a public address.
+ * What the SPP public-key registry says about one address (V137).
  *
- * CRITICAL RULE: Withdrawing more than the private balance MUST be blocked
- * before any proof is generated.
+ * `registered` is true only when the registry contract holds an entry for the
+ * address. `registryFullySynced` reports whether the local registry index has
+ * caught up to the network tip — a `registered: false` answer while the index
+ * is still syncing means "not seen yet", not "definitely absent".
  */
-export async function unshield(params: UnshieldParams): Promise<UnshieldResult> {
-  const network = getNetwork()
-  if (!isPrivacyEnabled(network.name)) {
-    throw new Error('Private payments are only supported on Stellar Testnet.')
+export interface RecipientRegistration {
+  registered: boolean
+  /** The recipient's `noteKey` from the registry entry, when registered. */
+  noteKey?: string
+  /** The recipient's `encryptionKey` from the registry entry, when registered. */
+  encryptionKey?: string
+  /** Ledger the registry entry was last modified on, when registered. */
+  ledger?: number
+  /** Whether the local registry index is caught up to the network tip. */
+  registryFullySynced: boolean
+}
+
+/**
+ * The transaction hash of a completed pool execution, or throws.
+ *
+ * The SPP SDK resolves `deposit` / `transfer` / `withdraw` to a
+ * `PoolExecuteResult` (`{ status, hashes, message, ... }`), not to a hash
+ * string — `String(result)` would render `[object Object]`. The hash is the
+ * first entry of `hashes`, and it only exists when `status === 'ok'`.
+ */
+function poolExecuteHash(result: { status: string; hashes: string[]; message?: string }): string {
+  if (result.status !== 'ok' || !result.hashes.length) {
+    throw new Error(result.message || 'The private transaction was not accepted by the pool.')
   }
+  return result.hashes[0]
+}
 
-  const asset = (params.asset || 'XLM').toUpperCase()
-  const withdrawAmount = parseFloat(params.amount)
+function toBigInt(value: bigint | number | string): bigint {
+  if (typeof value === 'bigint') return value
+  if (typeof value === 'number') return BigInt(Math.trunc(value))
+  return BigInt(value)
+}
 
-  if (isNaN(withdrawAmount) || withdrawAmount <= 0) {
-    throw new Error('Invalid withdrawal amount. Must be greater than 0.')
+async function getSigner() {
+  const keypair = await ensureFeePayer()
+  if (!keypair) {
+    throw new Error('No spending account is available for privacy operations. Fund your fee-payer first.')
   }
-
-  if (!params.destinationAddress || params.destinationAddress.trim().length < 5) {
-    throw new Error('Valid destination address required.')
-  }
-
-  // Pre-proof balance guard: strictly block before generating proof
-  const currentBalanceStr = await getPrivateBalance(asset)
-  const currentBalance = parseFloat(currentBalanceStr)
-
-  if (withdrawAmount > currentBalance) {
-    throw new Error(
-      `Insufficient private balance. Cannot withdraw ${params.amount} ${asset} (current balance: ${currentBalanceStr} ${asset}).`,
-    )
-  }
-
-  // Step 1: Prepare spending note
-  params.onProgress?.('Selecting private note and preparing withdrawal...')
-  await new Promise((resolve) => setTimeout(resolve, 300))
-
-  // Step 2: Prover generation (simulated WASM / SPP prover worker)
-  params.onProgress?.('Generating zero-knowledge proof (BN254 / Groth16)...')
-  await new Promise((resolve) => setTimeout(resolve, 500))
-
-  // Step 3: On-chain settlement via Soroban SPP pool
-  params.onProgress?.('Submitting withdrawal transaction to Stellar Testnet...')
-  await new Promise((resolve) => setTimeout(resolve, 400))
-
-  // Update private balance
-  const remainingBalance = Math.max(0, currentBalance - withdrawAmount).toFixed(7)
-  await setPrivateBalance(remainingBalance, asset)
-
-  // Generate transaction hash
-  const randomHex = Array.from({ length: 64 }, () => Math.floor(Math.random() * 16).toString(16)).join('')
-  const txHash = `${randomHex}`
-
-  // Record in wallet activity feed
-  try {
-    appendActivityFeed([
-      {
-        id: txHash,
-        type: 'received', // From perspective of public address receiving unshielded funds
-        amount: withdrawAmount.toFixed(7),
-        asset,
-        counterparty: 'Private Pool (Shielded Note)',
-        hash: txHash,
-        timestamp: Date.now(),
-        memo: 'Unshield from Private Pool',
-      },
-    ])
-  } catch {
-    // Non-fatal if activity feed fails in test env
-  }
-
-  params.onProgress?.('Withdrawal confirmed.')
 
   return {
-    txHash,
-    amount: withdrawAmount.toFixed(7),
-    asset,
-    destinationAddress: params.destinationAddress.trim(),
-    timestamp: Date.now(),
+    async getPublicKey() {
+      return keypair.publicKey()
+    },
+    async signMessage(message: string | Uint8Array) {
+      const bytes = typeof message === 'string' ? new TextEncoder().encode(message) : message
+      return keypair.sign(Buffer.from(bytes)).toString('base64')
+    },
+    async signTransaction(xdr: string, options?: { networkPassphrase?: string }) {
+      const transaction = TransactionBuilder.fromXDR(
+        xdr,
+        options?.networkPassphrase ?? getNetwork().networkPassphrase,
+      )
+      transaction.sign(keypair)
+      return { signedTxXdr: transaction.toXDR(), signerAddress: keypair.publicKey() }
+    },
+    async signAuthEntry(entry: string) {
+      const signature = keypair.sign(hash(Buffer.from(entry, 'base64')))
+      return { signedAuthEntry: signature.toString('base64'), signerAddress: keypair.publicKey() }
+    },
   }
+}
+
+function getContractConfig(config: NonNullable<ReturnType<typeof getSppConfig>>) {
+  const network = getNetwork()
+  return {
+    network: network.networkPassphrase,
+    deployer: config.deployer,
+    admin: config.admin,
+    asp_membership: config.aspMembership,
+    asp_non_membership: config.aspNonMembership,
+    verifiers: { B: config.verifiers.standard, B_gvk_T: config.verifiers.traceable },
+    public_key_registry: config.publicKeyRegistry,
+    pools: config.pools.map((pool) => {
+      const assetKind: 'native' | 'contract' = pool.assetKind === 'native' ? 'native' : 'contract'
+      return {
+        poolContractId: pool.id,
+        tokenContractId: pool.tokenContractId,
+        deploymentLedger: pool.deploymentLedger,
+        enabled: true,
+        policyFlags: [...pool.policyFlags],
+        ...(pool.gvkMode ? { gvkMode: pool.gvkMode } : {}),
+        asset: { kind: assetKind, code: 'XLM', symbol: 'XLM' },
+      }
+    }),
+  }
+}
+
+let clientPromise: Promise<PrivacyClient> | null = null
+
+async function initClient(): Promise<PrivacyClient> {
+  if (typeof window === 'undefined') {
+    throw new Error('Privacy is only available in the browser.')
+  }
+
+  const sppConfig = getSppConfig()
+  if (!sppConfig) {
+    throw new Error('SPP pool is not configured for this network yet.')
+  }
+
+  const module = await import('stellar-private-payments')
+  const storage = await module.Storage.open()
+  const network = getNetwork()
+  const client = await module.Client.new({
+    rpcUrl: network.rpcUrl,
+    storage,
+    contractConfig: getContractConfig(sppConfig),
+    circuitsBaseUrl: `${window.location.origin}/spp/circuits/`,
+    // Probe Veil's own archive and fall back to Nethermind's when it is
+    // unreachable (#719). Resolving here rather than trusting the static
+    // config is what makes the BootnodeBanner's claim true: the banner
+    // reports the outcome of this same cached probe, so without it the
+    // UI could say "using Nethermind" while the client used a dead URL.
+    bootnodeUrl: await resolveBootnodeWithFallback(getConfiguredBootnodeUrl()),
+  })
+
+  const signer = await getSigner()
+  // `userAddress` is deliberately omitted: SPP resolves it from
+  // `signer.getPublicKey()` and defaults `signerAddress` to it. Passing the
+  // wallet's `C…` contract address here while signing with the `G…` spending
+  // account would pair an address with a key that cannot authorise for it.
+  const account = await client.account({ networkPassphrase: network.networkPassphrase }, signer as any)
+
+  const pool = await account.pool({ poolContract: sppConfig.pools[0].id })
+
+  return {
+    async sync() {
+      await client.sync()
+    },
+    async privateBalance() {
+      return BigInt((await pool.balance()) ?? 0)
+    },
+    async shield(amount) {
+      const value = toBigInt(amount)
+      if (value <= 0n) throw new Error('Shield amount must be greater than zero.')
+      return poolExecuteHash(await pool.deposit(value))
+    },
+    async privateSend(recipient, amount) {
+      const value = toBigInt(amount)
+      if (value <= 0n) throw new Error('Private send amount must be greater than zero.')
+      return poolExecuteHash(await pool.transfer(recipient, value))
+    },
+    async unshield(amount, recipient) {
+      const value = toBigInt(amount)
+      if (value <= 0n) throw new Error('Unshield amount must be greater than zero.')
+      return poolExecuteHash(await pool.withdraw(value, recipient ?? undefined))
+    },
+    async recipientLookup(address) {
+      const lookup = await client.recipientLookup(address)
+      const entry = lookup.entry
+      return {
+        registered: entry !== undefined && entry !== null,
+        noteKey: entry?.noteKey,
+        encryptionKey: entry?.encryptionKey,
+        ledger: entry?.ledger,
+        registryFullySynced: lookup.registryFullySynced,
+      }
+    },
+    stop() {
+      client.stopBackgroundSync()
+    },
+  }
+}
+
+export async function getPrivacyClient(): Promise<PrivacyClient> {
+  // Cache the successful client only. A rejected promise left in place would
+  // make every later retry re-throw the first failure (an unfunded fee payer,
+  // say) until the page is reloaded.
+  clientPromise ??= initClient().catch((error) => {
+    clientPromise = null
+    throw error
+  })
+  return clientPromise
+}
+
+export function toUserFacingPrivacyError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error)
+  const cleaned = message.replace(/^Error:\s*/, '').trim()
+  if (!cleaned) return 'Privacy operation failed. Please try again.'
+
+  if (cleaned.includes('SPP pool is not configured')) return 'Privacy is not enabled on this network yet.'
+  if (cleaned.includes('No spending account is available')) return 'Your spending account is not ready yet. Fund it and try again.'
+  if (cleaned.includes('RPC')) return 'Privacy could not reach the network. Please try again in a moment.'
+
+  return cleaned
+}
+
+export function attachPrivacyProgress(handler: (event: PrivacyProgressEvent) => void) {
+  const eventName = 'stellar-private-payments:tx-progress'
+  const listener = ((event: Event) => {
+    const detail = (event as CustomEvent<PrivacyProgressEvent>).detail
+    if (detail) handler(detail)
+  }) as EventListener
+
+  window.addEventListener(eventName, listener)
+  return () => window.removeEventListener(eventName, listener)
 }
